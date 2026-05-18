@@ -1,4 +1,3 @@
-import itertools
 import requests
 from collections import defaultdict
 
@@ -9,45 +8,77 @@ BASE_URL = "https://api.squiggle.com.au/"
 # ---------------------------------------------------------
 def api_get(params):
     headers = {
-        "User-Agent": "afl-tipping-predictions/1.0",
+        "User-Agent": "afl-tipping-predictions/2.0",
         "Accept": "application/json"
     }
     r = requests.get(BASE_URL, params=params, headers=headers, timeout=30)
     r.raise_for_status()
     return r.json()
 
+# ---------------------------------------------------------
+# BASIC LOADERS
+# ---------------------------------------------------------
 def get_teams():
     data = api_get({"q": "teams"})
     return {t["id"]: t["name"] for t in data["teams"]}
 
 def get_games(year):
-    return api_get({"q": "games", "year": year})["games"]
+    return api_get({"q": "games", "year": year}).get("games", [])
 
 def get_ladder(year):
     return api_get({"q": "standings", "year": year}).get("standings", [])
 
 # ---------------------------------------------------------
-# FILTER: LAST 6 ROUNDS ONLY
+# GET LAST X HOME-AND-AWAY ROUNDS FROM PREVIOUS SEASON
 # ---------------------------------------------------------
-def filter_last_6_rounds(games, upto_round=None):
-    completed = [g for g in games if g.get("complete") == 100]
+def get_last_ha_rounds(prev_year, needed):
+    games = get_games(prev_year)
+    ha_games = [g for g in games if g.get("is_final") != 1 and g.get("round")]
 
-    if upto_round is not None:
-        completed = [g for g in completed if g["round"] < upto_round]
-
-    if not completed:
+    if not ha_games:
         return []
 
+    rounds = sorted({g["round"] for g in ha_games})
+    last_rounds = rounds[-needed:]
+    return [g for g in ha_games if g["round"] in last_rounds]
+
+# ---------------------------------------------------------
+# BUILD WINDOWED GAME SET
+# ---------------------------------------------------------
+def build_windowed_games(year, upto_round, rounds_back):
+    this_year_games = get_games(year)
+    ha_games = [g for g in this_year_games if g.get("is_final") != 1 and g.get("round")]
+
+    # Completed rounds only
+    completed = [g for g in ha_games if g.get("complete") == 100]
+
+    # Filter to rounds < upto_round
+    completed = [g for g in completed if g["round"] < upto_round]
+
+    # Identify rounds
     rounds = sorted({g["round"] for g in completed})
-    last_6 = set(rounds[-6:])
 
-    return [g for g in completed if g["round"] in last_6]
+    # If we have enough rounds in this season
+    if len(rounds) >= rounds_back:
+        last_rounds = rounds[-rounds_back:]
+        return [g for g in completed if g["round"] in last_rounds]
+
+    # Otherwise pull from previous season
+    needed = rounds_back - len(rounds)
+    prev_year = year - 1
+    prev_games = get_last_ha_rounds(prev_year, needed)
+
+    return prev_games + completed
 
 # ---------------------------------------------------------
-# BUILD TEAM STATS FROM A SET OF GAMES
+# TEAM STATS (HYBRID WINDOW MODEL)
 # ---------------------------------------------------------
-def build_stats_from_games(games_subset, teams, ladder_rows=None):
-    stats = {name: {
+def team_stats(year, rounds_back=6):
+    teams = get_teams()
+    all_games = get_games(year)
+
+    # Full-season stats (unchanged)
+    full_stats = {name: {
         "wins": 0,
         "games": 0,
         "margins": [],
@@ -57,9 +88,18 @@ def build_stats_from_games(games_subset, teams, ladder_rows=None):
         "opponents": []
     } for name in teams.values()}
 
-    for g in games_subset:
-        h = teams[g["hteamid"]]
-        a = teams[g["ateamid"]]
+    # Build full-season stats
+    for g in all_games:
+        if g.get("complete") != 100:
+            continue
+
+        hid = g.get("hteamid")
+        aid = g.get("ateamid")
+        if hid not in teams or aid not in teams:
+            continue
+
+        h = teams[hid]
+        a = teams[aid]
         hs = g["hscore"]
         as_ = g["ascore"]
 
@@ -69,45 +109,110 @@ def build_stats_from_games(games_subset, teams, ladder_rows=None):
         winner = h if hs > as_ else a
         margin = abs(hs - as_)
 
-        stats[h]["games"] += 1
-        stats[a]["games"] += 1
+        full_stats[h]["games"] += 1
+        full_stats[a]["games"] += 1
 
-        stats[h]["scores_for"].append(hs)
-        stats[h]["scores_against"].append(as_)
-        stats[a]["scores_for"].append(as_)
-        stats[a]["scores_against"].append(hs)
+        full_stats[h]["scores_for"].append(hs)
+        full_stats[h]["scores_against"].append(as_)
+        full_stats[a]["scores_for"].append(as_)
+        full_stats[a]["scores_against"].append(hs)
 
-        stats[h]["opponents"].append(a)
-        stats[a]["opponents"].append(h)
+        full_stats[h]["opponents"].append(a)
+        full_stats[a]["opponents"].append(h)
 
-        stats[winner]["wins"] += 1
-        stats[winner]["margins"].append(margin)
+        full_stats[winner]["wins"] += 1
+        full_stats[winner]["margins"].append(margin)
 
-        stats[h]["recent_results"].append(1 if winner == h else 0)
-        stats[a]["recent_results"].append(1 if winner == a else 0)
+        full_stats[h]["recent_results"].append(1 if winner == h else 0)
+        full_stats[a]["recent_results"].append(1 if winner == a else 0)
 
-    for t, s in stats.items():
-        s["last_5_wins"] = sum(s["recent_results"][-5:])
-        s["season_win_pct"] = (s["wins"] / s["games"] * 100) if s["games"] else 0
-        s["avg_winning_margin"] = (
-            sum(s["margins"]) / len(s["margins"]) if s["margins"] else 0
+    # Ladder positions
+    ladder = get_ladder(year)
+    for row in ladder:
+        name = row["name"]
+        if name in full_stats:
+            full_stats[name]["ladder_position"] = row["rank"]
+
+    # ---------------------------------------------------------
+    # WINDOWED STATS (R2 Hybrid Model)
+    # ---------------------------------------------------------
+    # Determine current round
+    completed = [g for g in all_games if g.get("complete") == 100 and g.get("round")]
+    if completed:
+        current_round = max(g["round"] for g in completed) + 1
+    else:
+        current_round = 1
+
+    window_games = build_windowed_games(year, current_round, rounds_back)
+
+    # Build windowed stats
+    win_stats = {t: {
+        "margins": [],
+        "recent_results": [],
+        "scores_for": [],
+        "scores_against": []
+    } for t in teams.values()}
+
+    for g in window_games:
+        hid = g.get("hteamid")
+        aid = g.get("ateamid")
+        if hid not in teams or aid not in teams:
+            continue
+
+        h = teams[hid]
+        a = teams[aid]
+        hs = g["hscore"]
+        as_ = g["ascore"]
+
+        if hs == as_:
+            continue
+
+        winner = h if hs > as_ else a
+        margin = abs(hs - as_)
+
+        win_stats[h]["scores_for"].append(hs)
+        win_stats[h]["scores_against"].append(as_)
+        win_stats[a]["scores_for"].append(as_)
+        win_stats[a]["scores_against"].append(hs)
+
+        win_stats[winner]["margins"].append(margin)
+
+        win_stats[h]["recent_results"].append(1 if winner == h else 0)
+        win_stats[a]["recent_results"].append(1 if winner == a else 0)
+
+    # Merge windowed stats into full stats
+    for t in full_stats:
+        ws = win_stats[t]
+
+        # Windowed metrics
+        full_stats[t]["last_5_wins"] = sum(ws["recent_results"][-5:])
+        full_stats[t]["avg_winning_margin"] = (
+            sum(ws["margins"]) / len(ws["margins"]) if ws["margins"] else 0
         )
-        s["form_margin"] = (
-            sum(s["margins"][-5:]) / len(s["margins"][-5:]) if s["margins"] else 0
+        full_stats[t]["form_margin"] = (
+            sum(ws["margins"][-5:]) / len(ws["margins"][-5:]) if ws["margins"] else 0
         )
-        s["attack"] = sum(s["scores_for"]) / len(s["scores_for"]) if s["scores_for"] else 0
-        s["defense"] = sum(s["scores_against"]) / len(s["scores_against"]) if s["scores_against"] else 0
+        full_stats[t]["attack"] = (
+            sum(ws["scores_for"]) / len(ws["scores_for"]) if ws["scores_for"] else 0
+        )
+        full_stats[t]["defense"] = (
+            sum(ws["scores_against"]) / len(ws["scores_against"]) if ws["scores_against"] else 0
+        )
 
-    if ladder_rows:
-        for row in ladder_rows:
-            name = row["name"]
-            if name in stats:
-                stats[name]["ladder_position"] = row["rank"]
+        # SAFETY FIXES
+        if "season_win_pct" not in full_stats[t]:
+            full_stats[t]["season_win_pct"] = 0
 
-    return stats
+        if "ladder_position" not in full_stats[t]:
+            full_stats[t]["ladder_position"] = 18
+
+        # Season-long metrics remain unchanged:
+        # season_win_pct, ladder_position, strength_of_schedule, venue_record
+
+    return full_stats, all_games, teams
 
 # ---------------------------------------------------------
-# METRICS
+# VENUE RECORD
 # ---------------------------------------------------------
 def venue_record(team, venue, games, teams):
     wins = 0
@@ -115,11 +220,16 @@ def venue_record(team, venue, games, teams):
     for g in games:
         if g.get("complete") != 100:
             continue
-        if g["venue"] != venue:
+        if g.get("venue") != venue:
             continue
 
-        home = teams[g["hteamid"]]
-        away = teams[g["ateamid"]]
+        hid = g.get("hteamid")
+        aid = g.get("ateamid")
+        if hid not in teams or aid not in teams:
+            continue
+
+        home = teams[hid]
+        away = teams[aid]
         hs = g["hscore"]
         as_ = g["ascore"]
 
@@ -133,13 +243,19 @@ def venue_record(team, venue, games, teams):
 
     return wins / total if total else 0
 
+# ---------------------------------------------------------
+# STRENGTH OF SCHEDULE
+# ---------------------------------------------------------
 def strength_of_schedule(team, stats):
     opps = stats[team]["opponents"]
     if not opps:
         return 0
     return sum(stats[o]["season_win_pct"] for o in opps) / len(opps)
 
-def m_ladder(t1, t2, s): return 1 if s[t1].get("ladder_position", 99) < s[t2].get("ladder_position", 99) else 0
+# ---------------------------------------------------------
+# METRICS
+# ---------------------------------------------------------
+def m_ladder(t1, t2, s): return 1 if s[t1]["ladder_position"] < s[t2]["ladder_position"] else 0
 def m_last5(t1, t2, s): return 1 if s[t1]["last_5_wins"] > s[t2]["last_5_wins"] else 0
 def m_avg_margin(t1, t2, s): return 1 if s[t1]["avg_winning_margin"] > s[t2]["avg_winning_margin"] else 0
 def m_win_pct(t1, t2, s): return 1 if s[t1]["season_win_pct"] > s[t2]["season_win_pct"] else 0
@@ -180,33 +296,22 @@ METRIC_FUNCS = {
     "attack_defense": m_attack_defense,
 }
 
-WEIGHTS = {
-    "venue_record": 3,
-    "home_adv": 2,
-    "win_pct": 2,
-    "ladder": 1,
-    "last5": 1,
-    "avg_margin": 1,
-    "form_margin": 1,
-    "sos": 1,
-    "attack_defense": 1,
-}
+# ---------------------------------------------------------
+# WEIGHTS
+# ---------------------------------------------------------
+WEIGHTS = {"ladder":2,
+            "last5":4,
+            "avg_margin":4,
+            "win_pct":3,
+            "home_adv":8,
+            "venue_record":8,
+            "form_margin":1,
+            "sos":2,
+            "attack_defense":1
+            }
 
 # ---------------------------------------------------------
-# TEAM STATS WINDOW (LAST 6 ROUNDS)
-# ---------------------------------------------------------
-def team_stats_window(year, upto_round=None):
-    games = get_games(year)
-    teams = get_teams()
-    ladder = get_ladder(year)
-
-    recent_games = filter_last_6_rounds(games, upto_round=upto_round)
-    stats = build_stats_from_games(recent_games, teams, ladder_rows=ladder)
-
-    return stats, games, teams
-
-# ---------------------------------------------------------
-# PREDICTION ENGINE
+# TEAM COMPARISON
 # ---------------------------------------------------------
 def compare_teams(home, away, venue, stats, games, teams):
     score_home = 0
@@ -218,9 +323,11 @@ def compare_teams(home, away, venue, stats, games, teams):
         if metric == "venue_record":
             h = fn(home, away, stats, games, teams, venue)
             a = fn(away, home, stats, games, teams, venue)
+
         elif metric == "home_adv":
             h = fn(home, away, venue)
             a = fn(away, home, venue)
+
         else:
             h = fn(home, away, stats)
             a = fn(away, home, stats)
@@ -259,6 +366,9 @@ def compare_teams(home, away, venue, stats, games, teams):
         "raw_diff": diff
     }
 
+# ---------------------------------------------------------
+# PREDICT A SINGLE GAME
+# ---------------------------------------------------------
 def predict_game(game, stats, games, teams):
     hid = game.get("hteamid")
     aid = game.get("ateamid")
@@ -268,7 +378,7 @@ def predict_game(game, stats, games, teams):
 
     home = teams[hid]
     away = teams[aid]
-    venue = game["venue"]
+    venue = game.get("venue")
 
     result = compare_teams(home, away, venue, stats, games, teams)
 
@@ -285,20 +395,18 @@ def predict_game(game, stats, games, teams):
     }
 
 # ---------------------------------------------------------
-# ROUND PREDICTION (NO LEAKAGE)
+# PREDICT A ROUND
 # ---------------------------------------------------------
-def predict_round(year, round_number):
-    stats, games, teams = team_stats_window(year, upto_round=round_number)
+def predict_round(year, round_number, rounds_back=6):
+    stats, games, teams = team_stats(year, rounds_back=rounds_back)
     round_games = [g for g in games if g.get("round") == round_number]
-
     return [predict_game(g, stats, games, teams) for g in round_games]
 
 # ---------------------------------------------------------
-# ACCURACY (NO SAME-WEEK LEAKAGE)
+# SEASON ACCURACY
 # ---------------------------------------------------------
-def season_accuracy(year):
-    games = get_games(year)
-    teams = get_teams()
+def season_accuracy(year, rounds_back=6):
+    stats, games, teams = team_stats(year, rounds_back=rounds_back)
 
     correct = 0
     total = 0
@@ -307,8 +415,9 @@ def season_accuracy(year):
         if g.get("complete") != 100:
             continue
 
-        stats, all_games, all_teams = team_stats_window(year, upto_round=g["round"])
-        pred = predict_game(g, stats, all_games, all_teams)
+        pred = predict_game(g, stats, games, teams)
+        if pred is None:
+            continue
 
         actual = teams[g["hteamid"]] if g["hscore"] > g["ascore"] else teams[g["ateamid"]]
 
@@ -319,119 +428,31 @@ def season_accuracy(year):
 
     accuracy = (correct / total * 100) if total else 0
     return accuracy, correct, total
+
 # ---------------------------------------------------------
-# PROJECTED LADDER (NO LEAKAGE)
+# PROJECTED LADDER
 # ---------------------------------------------------------
-def projected_ladder(year):
-    stats, games, teams = team_stats_window(year, upto_round=None)
+def projected_ladder(year, rounds_back=6):
+    stats, games, teams = team_stats(year, rounds_back=rounds_back)
     ladder = defaultdict(int)
 
     for g in games:
         if g.get("complete") == 100:
-            # Use actual result
             winner = teams[g["hteamid"]] if g["hscore"] > g["ascore"] else teams[g["ateamid"]]
             ladder[winner] += 1
         else:
-            # Predict future games using last 6 rounds only
             pred = predict_game(g, stats, games, teams)
             if pred and pred.get("winner"):
                 ladder[pred["winner"]] += 1
 
     return sorted(ladder.items(), key=lambda x: x[1], reverse=True)
 
-
 # ---------------------------------------------------------
 # PREMIERSHIP PROBABILITIES
 # ---------------------------------------------------------
-def premiership_probabilities(year):
-    ladder = projected_ladder(year)
-
+def premiership_probabilities(year, rounds_back=6):
+    ladder = projected_ladder(year, rounds_back=rounds_back)
     total_wins = sum(w for _, w in ladder)
     if total_wins == 0:
         return []
-
-    probs = [(team, round(w / total_wins * 100, 2)) for team, w in ladder]
-    return probs
-
-
-# ---------------------------------------------------------
-# TIPPING SHEET
-# ---------------------------------------------------------
-def tipping_sheet(year, round_number):
-    preds = predict_round(year, round_number)
-    sheet = []
-
-    for p in preds:
-        sheet.append(f"{p['home']} vs {p['away']} → {p['winner']} ({p['confidence']})")
-
-    return sheet
-
-
-# ---------------------------------------------------------
-# PRINT PREDICTIONS (CLI OUTPUT)
-# ---------------------------------------------------------
-def print_predictions(preds):
-    print("\n================ AFL PREDICTIONS ================\n")
-
-    for p in preds:
-        print(f"{p['home']} vs {p['away']} @ {p['venue']}")
-        print(f"→ Winner: {p['winner']} ({p['confidence']})")
-        print(f"→ Predicted Score: {p['predicted_home_score']} - {p['predicted_away_score']}")
-        print(f"→ Margin: {p['predicted_margin']} pts")
-        print(f"→ Raw Metric Diff: {p['raw_diff']}")
-        print("--------------------------------------------------")
-
-
-# ---------------------------------------------------------
-# MAIN MENU (CLI VERSION)
-# ---------------------------------------------------------
-def main():
-    while True:
-        print("\n=== AFL PREDICTION ENGINE (Last 6 Rounds Model) ===")
-        print("1) Predict a round")
-        print("2) Tipping sheet for a round")
-        print("3) Season accuracy so far")
-        print("4) Projected ladder")
-        print("5) Premiership probabilities")
-        print("Enter to quit")
-
-        choice = input("Select option: ").strip()
-        if choice == "":
-            break
-
-        year = int(input("Enter season year: ").strip())
-
-        if choice == "1":
-            rnd = int(input("Round number: ").strip())
-            preds = predict_round(year, rnd)
-            print_predictions(preds)
-
-        elif choice == "2":
-            rnd = int(input("Round number: ").strip())
-            sheet = tipping_sheet(year, rnd)
-            print("\n=== TIPPING SHEET ===\n")
-            for line in sheet:
-                print(line)
-
-        elif choice == "3":
-            acc, correct, total = season_accuracy(year)
-            print(f"\nSeason accuracy: {acc:.2f}% ({correct}/{total})")
-
-        elif choice == "4":
-            ladder = projected_ladder(year)
-            print("\n=== PROJECTED LADDER ===\n")
-            for i, (team, wins) in enumerate(ladder, start=1):
-                print(f"{i}. {team} — {wins} wins")
-
-        elif choice == "5":
-            probs = premiership_probabilities(year)
-            print("\n=== PREMIERSHIP PROBABILITIES ===\n")
-            for team, p in probs:
-                print(f"{team}: {p}%")
-
-        else:
-            print("Invalid option.")
-
-
-if __name__ == "__main__":
-    main()
+    return [(team, round(w / total_wins * 100, 2)) for team, w in ladder]
